@@ -252,19 +252,21 @@ def compress_model(model, variables, Ngrids, rmin):
     nsel = [list(model.params['valid_types']).index(i) for i in model.params['nsel']] if model.params['atomic'] else None
     Y = len(model.params['sr_mean'])
     Z = len(nsel) if model.params['atomic'] else Y
-    # prepare list of names, widths, sr_ranges (srmin and srmax) for all compressible embedding nets
+    # MODIFICATION: Compress one shared embedding net per stage instead of one net per species pair.
     sr_range = (np.array([0.,sr(rmin,model.params['rcut'])])-np.array(model.params['sr_mean'])[:,None])/np.array(model.params['sr_std'])[:,None]
+    sr_range_species = sr_range[nsel] if model.params['atomic'] else sr_range
+    sr_range_global = np.stack([sr_range_species[:,0].min(), sr_range_species[:,1].max()], axis=0)
     if model.params['use_mp']:
-        names = ['embedding_net_%d' % i for i in range(Y*Z + 2*Y**2)]
-        widths = Y*Z*[model.params['embed_widths']+model.params['embedMP_widths'][:1]] + 2*Y**2*[model.params['embed_widths']]
-        sr_ranges = np.concatenate([np.repeat(sr_range[nsel] if model.params['atomic'] else sr_range, Y, axis=0),
-                                    np.tile(np.repeat(sr_range, Y, axis=0),(2,1))])
-        out_linear_onlys = Y*Z*[True] + 2*Y**2*[False]
+        names = ['embedding_net_0', 'embedding_net_1']
+        widths = [model.params['embed_widths']+model.params['embedMP_widths'][:1], model.params['embed_widths']]
+        sr_ranges = np.repeat(sr_range_global[None,:], len(widths), axis=0)
+        out_linear_onlys = [True, False]
     else:
-        names = ['embedding_net_%d' % i for i in range(Y*Z)]
-        widths = Y*Z * [model.params['embed_widths']]
-        sr_ranges = np.repeat(sr_range[nsel] if model.params['atomic'] else sr_range, Y, axis=0)
-        out_linear_onlys = Y*Z * [False]
+        names = ['embedding_net_0']
+        widths = [model.params['embed_widths']]
+        sr_ranges = sr_range_global[None,:]
+        out_linear_onlys = [False]
+    # END MODIFICATION
     # compute poly_coeff for each embedding net
     variables['compress_var'] = {}
     err0, err1, err2 = [], [], []
