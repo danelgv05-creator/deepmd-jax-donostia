@@ -168,6 +168,7 @@ class DPModel(nn.Module):
             G_NselAW += (G2_axis_Nsel6A[...,None] * T_Nsel6W[:,:,None]).sum(1)
         if not self.params['atomic']: # Energy prediction
             # MODIFICACIÓN: use a sungle shared fitting net for all types
+            shared_fitting = fitting_net(self.params['fit_widths'])# Initialize a single general net
             first_pred = shared_fitting(G_NselAW.reshape(G_NselAW.shape[0], -1))[:, 0] # Pass every atom through the shared fitting net
             ebias_por_atomo = jnp.repeat(jnp.array(self.params['Ebias']), type_count)  # Create an array of Ebias values for each atom based on its type
             pred = (mask * (first_pred + ebias_por_atomo)).sum()                       #Sum the energies  and appy the mask
