@@ -48,8 +48,8 @@ class DPModel(nn.Module):
         
         # MODIFICATION: Build the chemical-type embedding once and reuse it for every species.
         ntypes = self.params['ntypes']
-        type_embedding_weights = self.param('type_embedding', 
-                                            lambda key: jnp.ones((ntypes, 2)) * 0.1)
+        type_embedding_weights = self.param('type_embedding',                        # Añdd type embedding to the learnable parameters
+                                            lambda key: jnp.ones((ntypes,self.params['embed_type_width'])) * 0.1) #Initialize the net weights for each type
         #jax.debug.print("Type embedding weights: {weights}", weights=type_embedding_weights)
         # END MODIFICATION
         
@@ -67,26 +67,26 @@ class DPModel(nn.Module):
         R_nselXm = [[concat([sr[:,None],r3] + ([r6] if self.params['use_2nd'] else []), axis=1)
                     for sr,r3,r6 in zip(sr_norm_nm[nsel[i]],R_n3m[nsel[i]],R_nsel6m[i])] for i in range(len(nsel))]
         # compute embedding net and atomic features T
-        if not self.params.get('use_mp', False): # original DP without message passing
+        if not self.params.get('use_mp', False):                                          # original DP without message passing
             # MODIFICATION: Reuse one shared embedding network for all chemical species.
-            shared_embed = embedding_net(self.params['embed_widths']) #General network G
+            shared_embed = embedding_net(self.params['embed_widths'])                     #General network G
             # MODIFICATION: Handle mixed types by processing each neighbor type separately
             type_idx_for_embed = selected_types if self.params['atomic'] else valid_types # Determine the type indices to use for embedding
-            embedding_list = [] # List to store embeddings for each type
+            embedding_list = []                                                           # List to store embeddings for each type
             for i in range(len(nsel)):
                 # MODIFICATION: For each selected type, sum contributions from all neighbor types
                 type_embedding_parts = [] # List to store the embeddings of the different type from neighbours
                 for j,(sr_vals,rx) in enumerate(zip(sr_centernorm_nm[nsel[i]], R_nselXm[i])):
                     # MODIFICATION: Expand type embeddings to match geometric tensor shapes (atoms, neighbors, features)
-                    n_atoms, n_neighbors = sr_vals.shape[0], sr_vals.shape[1] # Number of central and neighbour atoms of the selected type
+                    n_atoms, n_neighbors = sr_vals.shape[0], sr_vals.shape[1]                                                            # Number of central and neighbour atoms of the selected type
                     central_type_embed = jnp.tile(type_embedding_weights[type_idx_for_embed[i]][None,None,:], (n_atoms, n_neighbors, 1)) #Embedding for the central atom type
-                    neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1)) #Embedding for the neighbour atom type
-                    input_tensor = concat([sr_vals[:,:,None], central_type_embed, neighbor_type_embed], axis=2) # Combine geometric and chemical information into the input tensor
-                    embedded = shared_embed(input_tensor, compress, rx) # Compute embedding for this neighbour type
-                    type_embedding_parts.append(embedded) # Accumulate embeddings from all neighbor types for this central atom type
+                    neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1))       #Embedding for the neighbour atom type
+                    input_tensor = concat([sr_vals[:,:,None], central_type_embed, neighbor_type_embed], axis=2)                          # Combine geometric and chemical information into the input tensor
+                    embedded = shared_embed(input_tensor, compress, rx)                                                                  # Compute embedding for this neighbour type
+                    type_embedding_parts.append(embedded)                                                                                # Accumulate embeddings from all neighbor types for this central atom type
                 # END MODIFICATION
-                type_embedding = sum(type_embedding_parts) # Summ contributions of different neighbour typer for the current central atom type
-                embedding_list.append(type_embedding) # Accumulate the embedding for this selected type
+                type_embedding = sum(type_embedding_parts)                # Summ contributions of different neighbour typer for the current central atom type
+                embedding_list.append(type_embedding)                     # Accumulate the embedding for this selected type
             T_NselXW = concat(embedding_list, K=K) / self.params['Nnbrs'] # Final embedding for all selected types, averaged by number of neighbors
             # END MODIFICATION
 
@@ -94,7 +94,7 @@ class DPModel(nn.Module):
             C, E = self.params['embed_widths'][-1], self.params['embedMP_widths'][0]
             #MODIFICATION: Share the embedding stages across species, with chemistry injected through type embeddings.
             shared_embed_mp = embedding_net(self.params['embed_widths'] + (E,), out_linear_only=True) #One layer embedding for the escalar message 
-            shared_embed_t2 = embedding_net(self.params['embed_widths']) #General network G
+            shared_embed_t2 = embedding_net(self.params['embed_widths'])                              #General network G
             #MODIFICATION: Process each selected type separately for mixed-type support
             embed_nselmE_list = []
             for i in range(len(nsel)):
@@ -102,12 +102,12 @@ class DPModel(nn.Module):
                 embed_type_parts = []
                 for j, sr_vals in enumerate(sr_centernorm_nm[nsel[i]]):
                     #MODIFICATION: Expand type embeddings to match geometric tensor shapes (atoms, neighbors, features)
-                    n_atoms, n_neighbors = sr_vals.shape[0], sr_vals.shape[1] # Number of central and neighbour atoms of the selected type
-                    central_type_embed = jnp.tile(type_embedding_weights[selected_types[i]][None,None,:], (n_atoms, n_neighbors, 1)) #Embedding for the central atom type
-                    neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1)) #Embedding for the neighbour atom type
-                    input_tensor = concat([sr_vals[:,:,None], central_type_embed, neighbor_type_embed], axis=2) # Combine geometric and chemical information into the input tensor
-                    embedded = shared_embed_mp(input_tensor, compress) # Compute embedding for this neighbour type
-                    embed_type_parts.append(embedded) # Accumulate embeddings from all neighbor types for this central atom type
+                    n_atoms, n_neighbors = sr_vals.shape[0], sr_vals.shape[1]                                                        
+                    central_type_embed = jnp.tile(type_embedding_weights[selected_types[i]][None,None,:], (n_atoms, n_neighbors, 1)) 
+                    neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1))   
+                    input_tensor = concat([sr_vals[:,:,None], central_type_embed, neighbor_type_embed], axis=2)                      
+                    embedded = shared_embed_mp(input_tensor, compress)                                                               
+                    embed_type_parts.append(embedded)                                                                                
                 #END MODIFICATION
                 embed_nselmE_list.append(embed_type_parts) # List of embeddings for each selected type, where each element contains the contributions from all neighbor types
             embed_nselmE = embed_nselmE_list 
@@ -123,7 +123,7 @@ class DPModel(nn.Module):
                         #MODIFICATION: Expand type embeddings to match shapes
                         n_atoms, n_neighbors = sr_vals.shape[0], sr_vals.shape[1]
                         central_type_embed = jnp.tile(type_embedding_weights[valid_types[outer_i]][None,None,:], (n_atoms, n_neighbors, 1))
-                        neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1))
+                        neighbor_type_embed = jnp.tile(type_embedding_weights[valid_types[j]][None,None,:], (n_atoms, n_neighbors, 1)) #Cuantas veces multiplica cada eje
                         input_tensor = concat([sr_vals[:,:,None], central_type_embed, neighbor_type_embed], axis=2)
                         embedded = shared_embed_t2(input_tensor, compress, r4)
                         type_contributions.append(embedded)
@@ -168,20 +168,16 @@ class DPModel(nn.Module):
             G_NselAW += (G2_axis_Nsel6A[...,None] * T_Nsel6W[:,:,None]).sum(1)
         if not self.params['atomic']: # Energy prediction
             # MODIFICACIÓN: use a sungle shared fitting net for all types
-            shared_fitting = fitting_net(self.params['fit_widths'])
-            
-            # Call the shared fitting net for each type block
-            fit_n1 = [shared_fitting(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),type_count,0,K=K)]
-            pred = (mask * concat([f[:,0]+Eb for f,Eb in zip(fit_n1,self.params['Ebias'])], K=K)).sum()
+            first_pred = shared_fitting(G_NselAW.reshape(G_NselAW.shape[0], -1))[:, 0] # Pass every atom through the shared fitting net
+            ebias_por_atomo = jnp.repeat(jnp.array(self.params['Ebias']), type_count)  # Create an array of Ebias values for each atom based on its type
+            pred = (mask * (first_pred + ebias_por_atomo)).sum()                       #Sum the energies  and appy the mask
             
         else: # Atomic tensor prediction
             # MODIFICACIÓN: use a single shared fitting net
-            sel_count = [type_count[i] for i in nsel]
-            shared_fitting = fitting_net(self.params['fit_widths'], use_final=False)
-            
-            # Call the shared net for each type block
-            fit_nselW = [shared_fitting(G) for G in split(G_NselAW.reshape(G_NselAW.shape[0],-1),sel_count,0,K=K)]
-            #END OF MODIFICATION
+            sel_count = [type_count[i] for i in nsel] #Count each atom type number
+            shared_fitting = fitting_net(self.params['fit_widths'], use_final=False)# Initialize a single general net            
+            fit_all = shared_fitting(G_NselAW.reshape(G_NselAW.shape[0], -1))       # Pass G through the fitting net
+            fit_nselW = split(fit_all, sel_count, 0, K=K)                           #Divide the result into atomic types, to mantain type_pred compatibility
             if self.params['type'] == 'atomic_t2':
                 T_NselYW = (T_Nsel6W + tensor_3to6(T_Nsel3W, axis=1) + T_NselW[:,None] * jnp.array([1,1,1,0,0,0])[:,None])
             elif self.params['type'] == 'atomic':

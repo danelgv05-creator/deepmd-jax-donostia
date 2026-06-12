@@ -23,6 +23,7 @@ def train(
     atomic_sel: List[int] = None,
     embed_widths: List[int] = [32,32,64],
     embed_mp_widths: List[int] = [64,64,64],
+    embed_type_width: int = 2, #MODIFICATION: Include type widths
     fit_widths: List[int] = None,
     axis_neurons: int=12,
     lr: float = None,
@@ -292,6 +293,7 @@ def train(
         'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
         'embed_widths': embed_widths[:-1] if mp else embed_widths,
         'embedMP_widths': embed_widths[-1:] + embed_mp_widths if mp else None,
+        'embed_type_width': embed_type_width, #MODIFICATION: include type widths
         'fit_widths': fit_widths,
         'axis': axis_neurons,
         'Ebias': None if 'atomic' in model_type else train_data.fit_energy(),
