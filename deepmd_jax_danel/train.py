@@ -45,6 +45,7 @@ def train(
     checkpoint_path: str = None,
     step: int = 1000000,
     mp: bool = False,
+    universal: bool = True,
     atomic_sel: List[int] = None,
     embed_widths: List[int] = [32,32,64],
     embed_mp_widths: List[int] = [64,64,64],
@@ -189,15 +190,25 @@ def train(
         raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
 
 # =================================================================
-    # MODIFICATION: Read the checkpoint before the dataset to avoid chemical 'amnesia'
+    # MODIFICATION: Option to use a Fixed Universal Vocabulary (Z=1 to 94)
+    # or dynamically inherit the chemical types from the old checkpoint.
     # =================================================================
     old_chemical_types = None
     old_variables = None
     old_model = None
+    
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
-        print(f'# 🔍 Extrayendo memoria química de {checkpoint_path}...')
+        print(f'# Loading checkpoint from {checkpoint_path}...')
         old_model, old_variables = load_model(checkpoint_path, replicate=False)
         old_chemical_types = old_model.params.get('chemical_types', None)
+
+    if universal:
+        target_chemical_types = list(range(1, 95))
+        print('# Using Fixed Universal Vocabulary (Elements Z=1 to 94).')
+    else:
+        target_chemical_types = old_chemical_types
+        if target_chemical_types is not None:
+            print(f'# Using inherited dynamic vocabulary from checkpoint.')
 
     # load dataset
     if 'atomic' in model_type and atomic_data_prefix is None:
@@ -212,10 +223,10 @@ def train(
         raise ValueError('model_type should be "energy", "atomic", "atomic_t2", or "dplr".')
         
     train_data = Dataset(train_data_path,
-                           labels,
-                           {'atomic_sel':atomic_sel},
-                           chemical_types=old_chemical_types)  
-    #END OF MODIFICATION
+                         labels,
+                         {'atomic_sel': atomic_sel},
+                         chemical_types=target_chemical_types)  
+    # END OF MODIFICATION=================================================================
 
     train_data.compute_lattice_candidate(rcut)
     chemical_types = train_data.chemical_types
@@ -345,7 +356,8 @@ def train(
     new_ebias = None if 'atomic' in model_type else train_data.fit_energy()
 
     # =================================================================
-    # MODIFICATION: Take into account old model's 'valid_types' and normalization stats
+    # MODIFICATION: Inherit 'valid_types' and normalization stats 
+    # from the old model to ensure stable transitions between chunks.
     # =================================================================
     if old_model is not None:
         old_valid = old_model.params['valid_types']
@@ -353,7 +365,7 @@ def train(
         old_std = old_model.params['sr_std']
         old_ebias = old_model.params.get('Ebias', None)
         
-        # Unimos los elementos viejos con cualquier descubrimiento nuevo
+        # Merge the old elements with any new discoveries in the current chunk
         combined_valid = np.unique(np.concatenate([old_valid, stats['valid_types']]))
         
         new_mean, new_std, merged_ebias = [], [], []
@@ -376,8 +388,13 @@ def train(
         stats['sr_std'] = np.array(new_std, dtype=np.float32)
         if new_ebias is not None:
             new_ebias = np.array(merged_ebias, dtype=np.float32)
-    # =================================================================
 
+    # =================================================================
+    # Force the model to build the matrix with all real elements
+    # ignoring the automatic dataset trimming, even in Iter 0.
+    # =================================================================
+    if target_chemical_types is not None:
+        stats['ntypes'] = len(target_chemical_types)
     params = {
         'type': model_type,
         'atomic_data_prefix': atomic_data_prefix if 'atomic' in model_type else None,
