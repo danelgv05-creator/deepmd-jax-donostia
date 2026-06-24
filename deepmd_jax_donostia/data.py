@@ -78,40 +78,76 @@ class DatasetLeaf:
     """
     def __init__(self, labels, params, type_arr, data, paths=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
-        self.type_idx = np.array(type_arr, dtype=int)
+        
+        # =================================================================
+        # MODIFICATION: Universal Static Padding & Bucketing
+        # Calculates padding for ALL incoming data formats right at initialization.
+        # =================================================================
+        raw_natoms = len(type_arr)
+        buckets = [32, 64, 128, 256, 512, 1024]
+        bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+        pad_len = bucket - raw_natoms
+        
+        # The network will now always use the padded bucket size
+        self.natoms = bucket 
+        
+        # Pad type array with ghost identifiers (-1)
+        if pad_len > 0:
+            self.type_idx = np.pad(np.array(type_arr, dtype=int), (0, pad_len), constant_values=-1)
+        else:
+            self.type_idx = np.array(type_arr, dtype=int)
+            
         self.type = self.type_idx
         self.data = data
-        self.natoms = len(self.type_idx)
         self.nframes = len(self.data['coord'])
+        
         for l in labels:
             assert self.data[l].shape[0] == self.nframes, \
                 f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
         self.pointer = self.nframes
-        self.type_count = np.array([(self.type_idx == i).sum() for i in range(max(self.type_idx) + 1)])
-        self.ntypes = len(self.type_count)
-        self.valid_types = np.arange(self.ntypes)
+        
+        # Universal structural aggregation (treating all as type 0 for fast stats)
+        self.type_count = np.array([self.natoms])
+        self.ntypes = 1
+        self.valid_types = np.array([0])
+        
         self.nsel = params.get('atomic_sel', None)
         if self.nsel is not None:
-            self.nsel = [i for i in self.nsel if i in range(self.ntypes)]
+            self.nsel = [0]
+            
         if any(['atomic' in l for l in labels]):
             self.nlabels = sum(self.type_count[self.nsel])
         else:
             self.nlabels = self.natoms
+            
+        # =================================================================
+        # MODIFICATION: Pad physical matrices to fit the bucket universally
+        # =================================================================
         for l in labels:
             if l in ['coord', 'force']:
-                self.data[l] = self.data[l].reshape(self.data[l].shape[0], -1, 3)
+                # Reshape using the actual raw_natoms, then apply padding
+                v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, 3)
+                if pad_len > 0:
+                    v = np.pad(v, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
+                self.data[l] = v
             if l == 'energy':
                 self.data[l] = self.data[l].reshape(-1)
             if 'atomic' in l:
                 try:
-                    self.data[l] = self.data[l].reshape(self.data[l].shape[0], self.nlabels, -1)
+                    v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, -1)
+                    if pad_len > 0:
+                        v = np.pad(v, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
+                    self.data[l] = v
                     assert self.data[l].shape[2] in (3, 9)
                 except Exception:
                     raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
+                    
         self.data['box'] = self.data['box'].reshape(-1, 3, 3)
         self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
+        
         if paths is not None:
-            print('# Dataset loaded: %d frames/%d atoms. Path:' % (self.nframes, self.natoms),
+            from os.path import abspath
+            print('# Dataset loaded: %d frames/%d atoms (Padded from %d raw atoms). Path:' % (self.nframes, self.natoms, raw_natoms),
                   ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
 
     def count_max(self):
@@ -134,41 +170,78 @@ class DatasetLeaf:
         Nnbrs = (np.concatenate(sr_BnM, axis=1) > 0).sum(2).mean() + 1
         return np.array([sr_sum, sr_sum2, sr_count, Nnbrs * np.ones_like(sr_sum)])
 
+    def get_batch(self, batch_size, type='frame'):
+        if type == 'label':
+            batch_size = int(batch_size / self.nlabels + 1)
+        
+        actual_bs = min(batch_size, self.nframes - self.pointer)
+        
+        if actual_bs == 0:
+            self.pointer = 0
+            perm = np.random.permutation(self.nframes)
+            self.data = {l: self.data[l][perm] for l in self.data}
+            actual_bs = min(batch_size, self.nframes)
+            
+        batch = {
+            'atomic' if 'atomic' in l else l:
+            self.data[l][self.pointer : self.pointer + actual_bs]
+            for l in self.data
+        }
+        self.pointer += actual_bs
+
+        # Inyectar type_idx limpio
+        batch['type_idx'] = np.tile(self.type_idx, (actual_bs, 1))
+
+        # Calcular lattice args
+        import jax.numpy as jnp
+        from deepmd_jax_donostia.data import compute_lattice_candidate
+        rcut = self.params.get('rcut', 6.0) if hasattr(self, 'params') else 6.0
+        
+        box_batch = jnp.array(batch['box'])
+        batch_lattice_args = compute_lattice_candidate(box_batch, rcut, print_info=False)
+        
+        return batch, tuple(self.type_idx), batch_lattice_args
+
+    def compute_lattice_candidate(self, rcut):
+        self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
+
     def get_stats(self, rcut, bs):
-        self.params = {'ntypes': self.ntypes, 'rcut': rcut}
+        self.params = {'rcut': rcut}
         sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
         sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
+        
         self.params['valid_types'] = self.valid_types
         self.params['sr_mean'] = sr_sum / sr_count
         self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
         self.params['Nnbrs'] = Nnbrs[0]
+        
+        # =================================================================
+        # MODIFICATION: Universal dynamic embedding size allocation
+        # Regardless of dataset type (DP or ExtXYZ), we force the real 
+        # chemical count for the neural network embeddings.
+        # =================================================================
         if self.chemical_types is not None:
+            self.params['ntypes'] = len(self.chemical_types)
             self.params['chemical_types'] = self.chemical_types
+        else:
+            self.params['ntypes'] = self.type_idx.max() + 1
+            
         return self.params
-
-    def get_batch(self, batch_size, type='frame'):
-        if type == 'label':
-            batch_size = int(batch_size / self.nlabels + 1)
-        if self.pointer + batch_size > self.nframes:
-            self.pointer = 0
-            perm = np.random.permutation(self.nframes)
-            self.data = {l: self.data[l][perm] for l in self.data}
-        batch = {
-            'atomic' if 'atomic' in l else l:
-            self.data[l][self.pointer:min(self.pointer + batch_size, self.nframes)]
-            for l in self.data
-        }
-        self.pointer += batch_size
-        return batch, tuple(self.type_idx), self.lattice_args
-
-    def compute_lattice_candidate(self, rcut):
-        self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
 
     def fit_energy(self):
         energy_stats = self._get_energy_stats()
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
         type_count = type_count[:, self.valid_types]
-        return np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
+        
+        # =================================================================
+        # MODIFICATION: Universal Energy Bias Broadcasting
+        # Calculate a single structural energy bias and broadcast it
+        # to all chemical elements to prevent Index-Out-Of-Bounds errors.
+        # =================================================================
+        global_ebias = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)[0]
+        
+        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else (self.type_idx.max() + 1)
+        return np.ones(real_ntypes, dtype=np.float32) * global_ebias
 
     def get_atomic_label_scale(self):
         label = [label for label in self.data.keys() if 'atomic' in label][0]
@@ -236,18 +309,6 @@ class DatasetGroup:
         s = np.stack([subset._get_stats(rcut, bs) for subset in self.subsets], axis=-1)
         return (s * self.prob).sum(-1)
 
-    def get_stats(self, rcut, bs):
-        self.params = {'ntypes': self.ntypes, 'rcut': rcut}
-        sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
-        sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
-        self.params['valid_types'] = self.valid_types
-        self.params['sr_mean'] = sr_sum / sr_count
-        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
-        self.params['Nnbrs'] = Nnbrs[0]
-        if self.chemical_types is not None:
-            self.params['chemical_types'] = self.chemical_types
-        return self.params
-
     def get_batch(self, batch_size, type='frame'):
         subset = np.random.choice(len(self.subsets), p=self.prob)
         return self.subsets[subset].get_batch(batch_size, type)
@@ -256,11 +317,43 @@ class DatasetGroup:
         for subset in self.subsets:
             subset.compute_lattice_candidate(rcut)
 
+    def get_stats(self, rcut, bs):
+        self.params = {'rcut': rcut}
+        sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
+        sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
+        
+        self.params['valid_types'] = self.valid_types
+        self.params['sr_mean'] = sr_sum / sr_count
+        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
+        self.params['Nnbrs'] = Nnbrs[0]
+        
+        # =================================================================
+        # MODIFICATION: Universal dynamic embedding size allocation
+        # Regardless of dataset type (DP or ExtXYZ), we force the real 
+        # chemical count for the neural network embeddings.
+        # =================================================================
+        if self.chemical_types is not None:
+            self.params['ntypes'] = len(self.chemical_types)
+            self.params['chemical_types'] = self.chemical_types
+        else:
+            self.params['ntypes'] = self.type_idx.max() + 1
+            
+        return self.params
+
     def fit_energy(self):
         energy_stats = self._get_energy_stats()
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
         type_count = type_count[:, self.valid_types]
-        return np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
+        
+        # =================================================================
+        # MODIFICATION: Universal Energy Bias Broadcasting
+        # Calculate a single structural energy bias and broadcast it
+        # to all chemical elements to prevent Index-Out-Of-Bounds errors.
+        # =================================================================
+        global_ebias = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)[0]
+        
+        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else (self.type_idx.max() + 1)
+        return np.ones(real_ntypes, dtype=np.float32) * global_ebias
 
     def get_atomic_label_scale(self):
         return (np.array([subset.get_atomic_label_scale() for subset in self.subsets]) * np.array(self.prob)).sum()
@@ -278,9 +371,7 @@ class DatasetGroup:
 class ExtXYZDataset(DatasetGroup):
     """
     Dataset for extended XYZ (.xyz/.extxyz) files.
-
-    Parses frames using ASE and groups them by composition before constructing
-    internal DatasetLeaf subsets. Each composition group becomes one leaf.
+    Optimized for large, diverse datasets (e.g. Matbench) by using sequence hashing.
     """
     def __init__(self, paths, labels, params=None, chemical_types=None):
         raw_frames = []
@@ -316,25 +407,22 @@ class ExtXYZDataset(DatasetGroup):
         else:
             unknown = all_zs - set(chemical_types)
             if unknown:
-                # =========================================================
-                # MODIFICATION: Putting the new types at the end we mantain the previous ones
-                # =========================================================
-                print(f"# ⚛️ ¡Nuevos elementos descubiertos en este chunk! Expandiendo tabla: {sorted(unknown)}")
+                print(f"# ⚛️ New elements discovered! Expanding table: {sorted(unknown)}")
                 chemical_types = tuple(list(chemical_types) + sorted(unknown))
-                # raise ValueError(
-                #    'Atomic numbers %s in extxyz files not in chemical_types=%s'
-                #    % (sorted(unknown), chemical_types))
-                # END OF MODIFICATION
+                
         self.chemical_types = chemical_types
         z_to_idx = {z: i for i, z in enumerate(chemical_types)}
-        ntypes = len(chemical_types)
 
+        # =================================================================
+        # MODIFICATION: O(1) Sequence Hashing
+        # Avoid mathematical sorting; use exact sequence as a dict key.
+        # =================================================================
         groups = {}
         for entry in raw_frames:
             zs = entry.pop('_zs')
             types = np.array([z_to_idx[int(z)] for z in zs], dtype=int)
-            tc = tuple(int((np.sort(types) == i).sum()) for i in range(ntypes))
-            grp = groups.setdefault(tc, {'type': types, 'frames': []})
+            grp_key = tuple(types.tolist())
+            grp = groups.setdefault(grp_key, {'type': types, 'frames': []})
             grp['frames'].append(entry)
 
         subsets = []
@@ -344,9 +432,10 @@ class ExtXYZDataset(DatasetGroup):
             subsets.append(DatasetLeaf(labels, params or {}, grp['type'], data))
 
         super().__init__(subsets, chemical_types=chemical_types)
-        print('# Dataset loaded (extxyz): %d frames in %d composition group(s). Path:'
+        print('# Dataset loaded (extxyz): %d frames in %d strict sequence group(s). Path:'
               % (len(raw_frames), len(subsets)),
               ''.join(['\n# \t\'%s\'' % abspath(p) for p in paths]))
+    
 
 
 def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False):

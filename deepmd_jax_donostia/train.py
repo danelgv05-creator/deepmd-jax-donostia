@@ -427,13 +427,17 @@ def train(
 
     # initialize model variables
     batch, type_idx, lattice_args = train_data.get_batch(1)
-    static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
+    # MODIFICATION: Removed type_idx from static_args to prevent recompilation
+    static_args = nn.FrozenDict({'lattice': lattice_args}) 
+    
     if seed is None:
         seed = np.random.randint(65536)
+        
     variables = model.init(
                     jax.random.PRNGKey(seed),
                     batch['coord'][0],
                     batch['box'][0],
+                    batch['type_idx'][0], # Dynamic injection
                     static_args,
                 )
 
@@ -596,13 +600,11 @@ def train(
             loss_val = []
             for one_batch in val_batch:
                 v_batch, type_idx, lattice_args = one_batch
-                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                             'lattice': lattice_args})
+                static_args = nn.FrozenDict({'lattice': lattice_args})
                 loss_val.append(val_step(v_batch, variables, static_args))
 
         batch, type_idx, lattice_args = get_batch_train()
-        static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                     'lattice': lattice_args})
+        static_args = nn.FrozenDict({'lattice': lattice_args})
         variables, opt_state, state = train_step(batch,
                                                  variables,
                                                  opt_state,
@@ -614,8 +616,7 @@ def train(
             # observable train step
             for i in range(len(obs_train_data_path)):
                 batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'type_idx': tuple(type_idx),
-                                            'lattice': lattice_args})
+                static_args = nn.FrozenDict({'lattice': lattice_args})
                 variables, opt_state, state_obs = train_step_obs(batch,
                                                         variables,
                                                         opt_state,
@@ -715,7 +716,7 @@ def test(
             batch, type_idx, lattice_args = leaf.get_batch(bs)
             remaining -= bs
 
-            static_args = nn.FrozenDict({'type_idx': type_idx, 'lattice': lattice_args})
+            static_args = nn.FrozenDict({'lattice': lattice_args})
             pred = evaluate_fn(variables, batch['coord'], batch['box'], static_args)
 
             if model.params['type'] in ('energy', 'dplr'):
@@ -864,7 +865,7 @@ def process_long_range_subset(subset, dplr_q_atoms, dplr_q_wc, dplr_beta, dplr_r
     type_idx = np.asarray(type_idx)
     qatoms, qwc = dplr_charges(type_idx, dplr_q_atoms, dplr_q_wc,
                                wc_model.params['nsel'], wc_model.params['ntypes'])
-    static_args = nn.FrozenDict({'type_idx': tuple(type_idx), 'lattice': lattice_args})
+    static_args = nn.FrozenDict({'lattice': lattice_args})
 
     def lr_energy(coord, box, Ngrid):
         wc = wc_model.wc_predict(wc_variables, coord, box, static_args)

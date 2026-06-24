@@ -7,46 +7,53 @@ from jax.sharding import PartitionSpec as PSpec
 
 class DPModel(nn.Module):
     params: dict
-    def get_input(self, coord, static_args, nbrs_nm):
+    def get_input(self, coord, type_idx, static_args, nbrs_nm):
         # =================================================================
-        # MODIFICATION: Type-Agnostic Hack (Separate Geometry from Chemistry)
+        # MODIFICATION: Dynamic Padding Logic & Ghost Masks
         # =================================================================
-        # 1. Extract the STATIC real type indices using standard numpy
-        real_type_idx_static = np.asarray(static_args['type_idx'])
         
-        # 2. Create the fake indices as a STATIC numpy array
-        # This prevents the TracerArrayConversionError in reorder_by_device!
-        fake_type_idx = np.zeros_like(real_type_idx_static)
+        # N is now the PADDED size (e.g., 64, 128)
+        N = coord.shape[0]
         
-        # 3. Convert the real ones to JAX for the neural network embeddings later
-        real_type_idx = jnp.asarray(real_type_idx_static)
+        # 1. Fake indices for physical GPU reordering to bypass tracer errors
+        fake_type_idx = np.zeros(N, dtype=int)
         
-        # 4. Force the model to see only 1 universal group of atoms
-        type_count = np.array([coord.shape[0]])
+        # 2. Create the Ghost Mask BEFORE replacing indices
+        # (1.0 for real atoms, 0.0 for ghost atoms)
+        ghost_mask = jnp.where(type_idx != -1, 1.0, 0.0)
+        
+        # 3. Prevent out-of-bounds embedding lookups
+        # Replace -1 with 0 (safe index). The mask will annihilate its physics anyway.
+        real_type_idx = jnp.where(type_idx == -1, 0, type_idx)
+        
+        type_count = np.array([N])
         valid_types = np.array([0])
         nsel = [0] 
         
         compress = self.params.get('is_compressed', False)
         K = jax.device_count() if nbrs_nm is not None else 1
         
-        # Use the STATIC fake types for physical reordering (NumPy logic)
         coord = reorder_by_device(coord, fake_type_idx, K=K)  
         
         if nbrs_nm is not None:
             type_count_new = [-(-type_count[i]//K) for i in range(len(type_count))]
-            mask = get_mask_by_device(type_count)
-            return coord, type_count_new, mask, compress, K, nsel, nbrs_nm, fake_type_idx, real_type_idx
-        else:
-            return coord, type_count, jnp.ones_like(coord[:,0]), compress, 1, nsel, None, fake_type_idx, real_type_idx
-        #END OF MODIFICATION
+            device_mask = get_mask_by_device(type_count)
             
+            # Align dynamic arrays if partitioned across multiple GPUs
+            if K > 1:
+                real_type_idx = reorder_by_device(real_type_idx[:, None], fake_type_idx, K=K)[:, 0]
+                ghost_mask = reorder_by_device(ghost_mask[:, None], fake_type_idx, K=K)[:, 0]
+                
+            # Fuse the Multi-GPU physical mask with the Ghost padding mask
+            final_mask = device_mask * ghost_mask
+            return coord, type_count_new, final_mask, compress, K, nsel, nbrs_nm, fake_type_idx, real_type_idx
+        else:
+            return coord, type_count, ghost_mask, compress, 1, nsel, None, fake_type_idx, real_type_idx
+
     @nn.compact
-    @nn.compact
-    def __call__(self, coord_N3, box_33, static_args, nbrs_nm=None):
-        # =================================================================
-        # 1. SETUP: Separate Geometry (Fake) from Chemistry (Real)
-        # =================================================================
-        coord_N3, type_count, mask, compress, K, nsel, nbrs_nm, fake_type_idx, real_type_idx = self.get_input(coord_N3, static_args, nbrs_nm)
+    def __call__(self, coord_N3, box_33, type_idx, static_args, nbrs_nm=None):
+        # Pass type_idx dynamically
+        coord_N3, type_count, mask, compress, K, nsel, nbrs_nm, fake_type_idx, real_type_idx = self.get_input(coord_N3, type_idx, static_args, nbrs_nm)
         A, L = self.params['axis'], static_args['lattice']['lattice_max'] if nbrs_nm is None else None
         
         ntypes_real = self.params['ntypes']
@@ -166,24 +173,25 @@ class DPModel(nn.Module):
         debug = T_NselYW if self.params['atomic'] else T_NselXW
         return pred * self.params['out_norm'], debug
 
-    def energy(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
-        pred, _ = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)
+    def energy(self, variables, coord_N3, box_33, type_idx, static_args, nbrs_nm=None):
+        pred, _ = self.apply(variables, coord_N3, box_33, type_idx, static_args, nbrs_nm)
         return pred
 
-    def energy_and_force(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
-        (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, static_args, nbrs_nm)
+    def energy_and_force(self, variables, coord_N3, box_33, type_idx, static_args, nbrs_nm=None):
+        (pred, _), g = value_and_grad(self.apply, argnums=1, has_aux=True)(variables, coord_N3, box_33, type_idx, static_args, nbrs_nm)
         return pred, -g
-    
-    def wc_predict(self, variables, coord_N3, box_33, static_args, nbrs_nm=None):
-        wc_relative = self.apply(variables, coord_N3, box_33, static_args, nbrs_nm)[0]
-        nsel_mask = np.isin(np.asarray(static_args['type_idx']), self.params['nsel'])
+
+    def wc_predict(self, variables, coord_N3, box_33, type_idx, static_args, nbrs_nm=None):
+        wc_relative = self.apply(variables, coord_N3, box_33, type_idx, static_args, nbrs_nm)[0]
+        nsel_mask = jnp.isin(type_idx, jnp.array(self.params['nsel']))
         return coord_N3[nsel_mask] + wc_relative
-    
+
     def get_loss_fn(self, order='l2'):
         if self.params['atomic'] is False:
-            vmap_energy_and_force = vmap(self.energy_and_force, (None, 0, 0, None))
+            # Map over batch dimension (0) for coord, box, and now type_idx
+            vmap_energy_and_force = vmap(self.energy_and_force, (None, 0, 0, 0, None))
             def loss_ef(variables, batch_data, pref, static_args):
-                e, f = vmap_energy_and_force(variables, batch_data['coord'], batch_data['box'], static_args)
+                e, f = vmap_energy_and_force(variables, batch_data['coord'], batch_data['box'], batch_data['type_idx'], static_args)
                 if order == 'l2':
                     le = ((batch_data['energy'] - e)**2).mean() / (f.shape[1])**2
                     lf = ((batch_data['force'] - f)**2).mean()
