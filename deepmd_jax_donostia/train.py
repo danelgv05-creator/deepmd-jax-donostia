@@ -85,6 +85,7 @@ def train(
     obs_temperature: Union[float, list] = None,
     obs_target: Union[float, str, list, None] = None,
     obs_step_every: int = 1,
+    fit_ebias: bool = False,
 ):
     '''
         Entry point for training deepmd-jax models.
@@ -353,7 +354,20 @@ def train(
 
     # construct model
     stats = train_data.get_stats(rcut, getstat_bs)
-    new_ebias = None if 'atomic' in model_type else train_data.fit_energy()
+    
+    # =================================================================
+    # MODIFICATION: Optional Ebias computation
+    # =================================================================
+    if 'atomic' in model_type:
+        new_ebias = None
+    else:
+        if fit_ebias:
+            new_ebias = train_data.fit_energy()
+            print('# Ebias dynamically computed from dataset using least squares.')
+        else:
+            # Inject a zero-filled array to bypass computation but preserve JAX shapes
+            new_ebias = np.zeros(stats['ntypes'], dtype=np.float32)
+            print('# Ebias computation skipped (fit_ebias=False). Assumed 0.0 for all elements.')
 
     # =================================================================
     # MODIFICATION: Inherit 'valid_types' and normalization stats 

@@ -78,78 +78,104 @@ class DatasetLeaf:
     """
     def __init__(self, labels, params, type_arr, data, paths=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
+        type_arr = np.array(type_arr, dtype=int)
         
-        # =================================================================
-        # MODIFICATION: Universal Static Padding & Bucketing
-        # Calculates padding for ALL incoming data formats right at initialization.
-        # =================================================================
-        raw_natoms = len(type_arr)
-        buckets = [32, 64, 128, 256, 512, 1024]
-        bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
-        pad_len = bucket - raw_natoms
-        
-        # The network will now always use the padded bucket size
-        self.natoms = bucket 
-        
-        # Pad type array with ghost identifiers (-1)
-        if pad_len > 0:
-            self.type_idx = np.pad(np.array(type_arr, dtype=int), (0, pad_len), constant_values=-1)
+        # --- NUEVA LÓGICA: Soporte para Buckets 2D (ExtXYZ y Matbench) ---
+        if type_arr.ndim == 2:
+            self.type_idx = type_arr  # (N_frames, N_atoms)
+            self.natoms = type_arr.shape[1]
+            self.data = data
+            self.nframes = len(self.data['coord'])
+            
+            # Recuperar matrices de conteo real para el Ebias
+            self._frame_type_counts = data.pop('_type_counts')
+            self.ntypes = self._frame_type_counts.shape[1]
+            self.type_count = self._frame_type_counts.sum(axis=0)
+            self.valid_types = np.arange(self.ntypes)[self.type_count > 0]
+            
+            for l in labels:
+                if l == 'energy':
+                    self.data[l] = self.data[l].reshape(-1)
+            
+            self.data['box'] = self.data['box'].reshape(-1, 3, 3)
+            self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
+            
+            self.pointer = self.nframes
+            self.nsel = params.get('atomic_sel', None)
+            if self.nsel is not None:
+                self.nsel = [0]
+            if any(['atomic' in l for l in labels]):
+                self.nlabels = sum(self.type_count[self.nsel])
+            else:
+                self.nlabels = self.natoms
+                
+            if paths is not None:
+                from os.path import abspath
+                print('# Dataset Leaf (Bucket %d): %d frames. Path:' % (self.natoms, self.nframes),
+                      ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
+
+        # --- LÓGICA ANTERIOR: Para formato DP clásico (1D) ---
         else:
-            self.type_idx = np.array(type_arr, dtype=int)
+            raw_natoms = len(type_arr)
+            real_type_arr = type_arr
             
-        self.type = self.type_idx
-        self.data = data
-        self.nframes = len(self.data['coord'])
-        
-        for l in labels:
-            assert self.data[l].shape[0] == self.nframes, \
-                f"{l}.npy has {self.data[l].shape[0]} frames, expected {self.nframes}"
-        self.pointer = self.nframes
-        
-        # Universal structural aggregation (treating all as type 0 for fast stats)
-        self.type_count = np.array([self.natoms])
-        self.ntypes = 1
-        self.valid_types = np.array([0])
-        
-        self.nsel = params.get('atomic_sel', None)
-        if self.nsel is not None:
-            self.nsel = [0]
+            self.raw_natoms = raw_natoms
+            self.raw_type_arr = real_type_arr
+            self.type_count = np.bincount(real_type_arr)
+            self.ntypes = len(self.type_count)
+            self.valid_types = np.arange(self.ntypes)[self.type_count > 0]
             
-        if any(['atomic' in l for l in labels]):
-            self.nlabels = sum(self.type_count[self.nsel])
-        else:
-            self.nlabels = self.natoms
+            buckets = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
+            bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+            pad_len = bucket - raw_natoms
             
-        # =================================================================
-        # MODIFICATION: Pad physical matrices to fit the bucket universally
-        # =================================================================
-        for l in labels:
-            if l in ['coord', 'force']:
-                # Reshape using the actual raw_natoms, then apply padding
-                v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, 3)
-                if pad_len > 0:
-                    v = np.pad(v, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
-                self.data[l] = v
-            if l == 'energy':
-                self.data[l] = self.data[l].reshape(-1)
-            if 'atomic' in l:
-                try:
-                    v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, -1)
+            self.natoms = bucket 
+            if pad_len > 0:
+                self.type_idx = np.pad(real_type_arr, (0, pad_len), constant_values=-1)
+            else:
+                self.type_idx = real_type_arr
+                
+            self.type = self.type_idx
+            self.data = data
+            self.nframes = len(self.data['coord'])
+            
+            for l in labels:
+                assert self.data[l].shape[0] == self.nframes
+            self.pointer = self.nframes
+            
+            self.nsel = params.get('atomic_sel', None)
+            if self.nsel is not None:
+                self.nsel = [0]
+                
+            if any(['atomic' in l for l in labels]):
+                self.nlabels = sum(self.type_count[self.nsel])
+            else:
+                self.nlabels = self.natoms
+                
+            for l in labels:
+                if l in ['coord', 'force']:
+                    v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, 3)
                     if pad_len > 0:
                         v = np.pad(v, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
                     self.data[l] = v
-                    assert self.data[l].shape[2] in (3, 9)
-                except Exception:
-                    raise ValueError('Atomic label must have 3 (vector) or 9 (3x3 tensor) components per atom.')
+                if l == 'energy':
+                    self.data[l] = self.data[l].reshape(-1)
+                if 'atomic' in l:
+                    try:
+                        v = self.data[l].reshape(self.data[l].shape[0], raw_natoms, -1)
+                        if pad_len > 0:
+                            v = np.pad(v, ((0, 0), (0, pad_len), (0, 0)), mode='constant')
+                        self.data[l] = v
+                    except:
+                        pass
                     
-        self.data['box'] = self.data['box'].reshape(-1, 3, 3)
-        self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
-        
-        if paths is not None:
-            from os.path import abspath
-            print('# Dataset loaded: %d frames/%d atoms (Padded from %d raw atoms). Path:' % (self.nframes, self.natoms, raw_natoms),
-                  ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
-
+            self.data['box'] = self.data['box'].reshape(-1, 3, 3)
+            self.data['coord'] = np.array(vmap(shift)(self.data['coord'], self.data['box']))
+            
+            if paths is not None:
+                from os.path import abspath
+                print('# Dataset loaded: %d frames/%d atoms (Padded from %d raw atoms). Path:' % (self.nframes, self.natoms, raw_natoms),
+                      ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
     def count_max(self):
         return np.array(self.type_count)
 
@@ -161,12 +187,25 @@ class DatasetLeaf:
             raise AttributeError("lattice_args not set. Call compute_lattice_candidate(rcut) before get_stats.")
         batch = self.get_batch(bs)[0]
         coord, box = batch['coord'], batch['box']
-        coord = coord[:, np.argsort(self.type_idx, kind='stable')]
-        r_Bnm = vmap(get_relative_coord, (0, 0, None, None))(coord, box, self.type_count, self.lattice_args)[1]
+        
+        if self.type_idx.ndim == 2:
+            # Para buckets 2D extraemos el primer frame sin átomos fantasma para las estadísticas
+            real_mask = batch['type_idx'][0] != -1
+            coord = coord[0:1, real_mask]
+            box = box[0:1]
+            real_type_arr = batch['type_idx'][0][real_mask]
+            type_count = np.bincount(real_type_arr, minlength=self.ntypes)
+            coord = coord[:, np.argsort(real_type_arr, kind='stable')]
+        else:
+            coord = coord[:, :self.raw_natoms]
+            coord = coord[:, np.argsort(self.raw_type_arr, kind='stable')]
+            type_count = self.type_count
+            
+        r_Bnm = vmap(get_relative_coord, (0, 0, None, None))(coord, box, type_count, self.lattice_args)[1]
         sr_BnM = [sr(jnp.concatenate(r, axis=-1), rcut) for r in r_Bnm]
-        sr_sum = np.array([sr.sum() for sr in sr_BnM])
-        sr_sum2 = np.array([(sr**2).sum() for sr in sr_BnM])
-        sr_count = np.array([(sr > 1e-15).sum() for sr in sr_BnM])
+        sr_sum = np.array([s.sum() for s in sr_BnM])
+        sr_sum2 = np.array([(s**2).sum() for s in sr_BnM])
+        sr_count = np.array([(s > 1e-15).sum() for s in sr_BnM])
         Nnbrs = (np.concatenate(sr_BnM, axis=1) > 0).sum(2).mean() + 1
         return np.array([sr_sum, sr_sum2, sr_count, Nnbrs * np.ones_like(sr_sum)])
 
@@ -174,33 +213,32 @@ class DatasetLeaf:
         if type == 'label':
             batch_size = int(batch_size / self.nlabels + 1)
         
-        actual_bs = min(batch_size, self.nframes - self.pointer)
+        # =================================================================
+        # MODIFICATION: Dynamic Batch Size (VRAM Protection)
+        # Fixes the volume of atoms per batch rather than the number of frames.
+        # =================================================================
+        vram_atom_budget = 2048  # Límite seguro
+        dynamic_bs = max(1, vram_atom_budget // self.natoms)
         
-        if actual_bs == 0:
-            self.pointer = 0
-            perm = np.random.permutation(self.nframes)
-            self.data = {l: self.data[l][perm] for l in self.data}
-            actual_bs = min(batch_size, self.nframes)
+        # Usamos el menor entre el batch solicitado y el dinámico permitido
+        actual_bs = min(batch_size, dynamic_bs)
+        
+        indices = np.arange(self.pointer, self.pointer + actual_bs) % self.nframes
+        self.pointer = (self.pointer + actual_bs) % self.nframes
             
         batch = {
             'atomic' if 'atomic' in l else l:
-            self.data[l][self.pointer : self.pointer + actual_bs]
+            self.data[l][indices]
             for l in self.data
         }
-        self.pointer += actual_bs
 
-        # Inyectar type_idx limpio
-        batch['type_idx'] = np.tile(self.type_idx, (actual_bs, 1))
+        # --- Inyectar type_idx limpio según si es 1D o 2D ---
+        if self.type_idx.ndim == 2:
+            batch['type_idx'] = self.type_idx[indices]
+        else:
+            batch['type_idx'] = np.tile(self.type_idx, (actual_bs, 1))
 
-        # Calcular lattice args
-        import jax.numpy as jnp
-        from deepmd_jax_donostia.data import compute_lattice_candidate
-        rcut = self.params.get('rcut', 6.0) if hasattr(self, 'params') else 6.0
-        
-        box_batch = jnp.array(batch['box'])
-        batch_lattice_args = compute_lattice_candidate(box_batch, rcut, print_info=False)
-        
-        return batch, tuple(self.type_idx), batch_lattice_args
+        return batch, tuple(self.type_idx.flatten()), self.lattice_args
 
     def compute_lattice_candidate(self, rcut):
         self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
@@ -210,16 +248,19 @@ class DatasetLeaf:
         sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
         sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
         
+        # --- LÓGICA CORREGIDA: Protección contra división por cero ---
+        sr_count_safe = np.maximum(sr_count, 1)
+        
         self.params['valid_types'] = self.valid_types
-        self.params['sr_mean'] = sr_sum / sr_count
-        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
+        self.params['sr_mean'] = sr_sum / sr_count_safe
+        
+        # Uso de np.maximum para evitar raíces de números negativos por precisión flotante
+        variance = sr_sum2 / sr_count_safe - self.params['sr_mean']**2
+        self.params['sr_std'] = np.sqrt(np.maximum(variance, 0.0))
+        
         self.params['Nnbrs'] = Nnbrs[0]
         
-        # =================================================================
-        # MODIFICATION: Universal dynamic embedding size allocation
-        # Regardless of dataset type (DP or ExtXYZ), we force the real 
-        # chemical count for the neural network embeddings.
-        # =================================================================
+        # Forzar el conteo químico real para los embeddings de la red
         if self.chemical_types is not None:
             self.params['ntypes'] = len(self.chemical_types)
             self.params['chemical_types'] = self.chemical_types
@@ -233,22 +274,18 @@ class DatasetLeaf:
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
         type_count = type_count[:, self.valid_types]
         
-        # =================================================================
-        # MODIFICATION: Universal Energy Bias Broadcasting
-        # Calculate a single structural energy bias and broadcast it
-        # to all chemical elements to prevent Index-Out-Of-Bounds errors.
-        # =================================================================
-        global_ebias = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)[0]
+        # --- LÓGICA CORREGIDA: Resolver Ebias para cada elemento ---
+        ebias_valid = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
         
-        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else (self.type_idx.max() + 1)
-        return np.ones(real_ntypes, dtype=np.float32) * global_ebias
+        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else self.ntypes
+        ebias_full = np.zeros(real_ntypes, dtype=np.float32)
+        ebias_full[self.valid_types] = ebias_valid
+        
+        return ebias_full
 
     def get_atomic_label_scale(self):
         label = [label for label in self.data.keys() if 'atomic' in label][0]
         return np.std(self.data[label])
-
-    def _get_energy_stats(self):
-        return [(self.type_count, self.data['energy'].mean())]
 
     def get_flattened_data(self):
         return [{'data': self.data, 'type_idx': self.type_idx, 'lattice_args': self.lattice_args}]
@@ -316,22 +353,34 @@ class DatasetGroup:
     def compute_lattice_candidate(self, rcut):
         for subset in self.subsets:
             subset.compute_lattice_candidate(rcut)
+            
+        # =================================================================
+        # MODIFICATION: Unify lattice_args across all subsets
+        # This prevents recompilation when switching between different leaves.
+        # =================================================================
+        best_subset = max(self.subsets, key=lambda s: s.lattice_args['lattice_max'])
+        global_lattice_args = best_subset.lattice_args
+        for subset in self.subsets:
+            subset.lattice_args = global_lattice_args
 
     def get_stats(self, rcut, bs):
         self.params = {'rcut': rcut}
         sr_sum, sr_sum2, sr_count, Nnbrs = self._get_stats(rcut, bs)
         sr_sum, sr_sum2, sr_count = sr_sum[self.valid_types], sr_sum2[self.valid_types], sr_count[self.valid_types]
         
+        # --- LÓGICA CORREGIDA: Protección contra división por cero ---
+        sr_count_safe = np.maximum(sr_count, 1)
+        
         self.params['valid_types'] = self.valid_types
-        self.params['sr_mean'] = sr_sum / sr_count
-        self.params['sr_std'] = np.sqrt(sr_sum2 / sr_count - self.params['sr_mean']**2)
+        self.params['sr_mean'] = sr_sum / sr_count_safe
+        
+        # Uso de np.maximum para evitar raíces de números negativos por precisión flotante
+        variance = sr_sum2 / sr_count_safe - self.params['sr_mean']**2
+        self.params['sr_std'] = np.sqrt(np.maximum(variance, 0.0))
+        
         self.params['Nnbrs'] = Nnbrs[0]
         
-        # =================================================================
-        # MODIFICATION: Universal dynamic embedding size allocation
-        # Regardless of dataset type (DP or ExtXYZ), we force the real 
-        # chemical count for the neural network embeddings.
-        # =================================================================
+        # Forzar el conteo químico real para los embeddings de la red
         if self.chemical_types is not None:
             self.params['ntypes'] = len(self.chemical_types)
             self.params['chemical_types'] = self.chemical_types
@@ -345,15 +394,14 @@ class DatasetGroup:
         type_count, energy_mean = [np.array(x) for x in zip(*energy_stats)]
         type_count = type_count[:, self.valid_types]
         
-        # =================================================================
-        # MODIFICATION: Universal Energy Bias Broadcasting
-        # Calculate a single structural energy bias and broadcast it
-        # to all chemical elements to prevent Index-Out-Of-Bounds errors.
-        # =================================================================
-        global_ebias = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)[0]
+        # --- LÓGICA CORREGIDA: Resolver Ebias para cada elemento ---
+        ebias_valid = np.linalg.lstsq(type_count, energy_mean, rcond=1e-3)[0].astype(np.float32)
         
-        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else (self.type_idx.max() + 1)
-        return np.ones(real_ntypes, dtype=np.float32) * global_ebias
+        real_ntypes = len(self.chemical_types) if self.chemical_types is not None else self.ntypes
+        ebias_full = np.zeros(real_ntypes, dtype=np.float32)
+        ebias_full[self.valid_types] = ebias_valid
+        
+        return ebias_full
 
     def get_atomic_label_scale(self):
         return (np.array([subset.get_atomic_label_scale() for subset in self.subsets]) * np.array(self.prob)).sum()
@@ -371,7 +419,7 @@ class DatasetGroup:
 class ExtXYZDataset(DatasetGroup):
     """
     Dataset for extended XYZ (.xyz/.extxyz) files.
-    Optimized for large, diverse datasets (e.g. Matbench) by using sequence hashing.
+    Optimized for extremely diverse datasets (Matbench/MPTraj) using Bucket Hashing.
     """
     def __init__(self, paths, labels, params=None, chemical_types=None):
         raw_frames = []
@@ -414,25 +462,51 @@ class ExtXYZDataset(DatasetGroup):
         z_to_idx = {z: i for i, z in enumerate(chemical_types)}
 
         # =================================================================
-        # MODIFICATION: O(1) Sequence Hashing
-        # Avoid mathematical sorting; use exact sequence as a dict key.
+        # MODIFICATION: O(1) Bucket Hashing for Matbench/MPTraj
+        # Group by padded bucket size instead of exact chemical sequence.
         # =================================================================
         groups = {}
+        buckets = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
+
         for entry in raw_frames:
             zs = entry.pop('_zs')
             types = np.array([z_to_idx[int(z)] for z in zs], dtype=int)
-            grp_key = tuple(types.tolist())
-            grp = groups.setdefault(grp_key, {'type': types, 'frames': []})
+            raw_natoms = len(types)
+            
+            bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+            pad_len = bucket - raw_natoms
+            
+            bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+            pad_len = bucket - raw_natoms
+            
+            # Guardar el conteo de elementos reales de ESTE frame para el Ebias
+            type_count = np.bincount(types, minlength=len(chemical_types))
+            entry['_type_count'] = type_count
+            
+            # Aplicar padding individualmente para que NumPy deje agruparlos
+            if pad_len > 0:
+                types = np.pad(types, (0, pad_len), constant_values=-1)
+                for l in labels:
+                    if l in ['coord', 'force']:
+                        entry[l] = np.pad(entry[l], ((0, pad_len), (0, 0)), mode='constant')
+                    elif 'atomic' in l:
+                        entry[l] = np.pad(entry[l], ((0, pad_len), (0, 0)), mode='constant')
+            
+            grp = groups.setdefault(bucket, {'type': [], 'frames': []})
+            grp['type'].append(types)
             grp['frames'].append(entry)
 
         subsets = []
-        for grp in groups.values():
+        for bucket, grp in groups.items():
             frames = grp['frames']
             data = {l: np.stack([f[l] for f in frames]) for l in labels}
-            subsets.append(DatasetLeaf(labels, params or {}, grp['type'], data))
+            data['_type_counts'] = np.stack([f['_type_count'] for f in frames])
+            
+            type_arr_2d = np.stack(grp['type'])
+            subsets.append(DatasetLeaf(labels, params or {}, type_arr_2d, data))
 
         super().__init__(subsets, chemical_types=chemical_types)
-        print('# Dataset loaded (extxyz): %d frames in %d strict sequence group(s). Path:'
+        print('# Dataset loaded (extxyz bucketed): %d frames grouped into %d bucket(s). Path:'
               % (len(raw_frames), len(subsets)),
               ''.join(['\n# \t\'%s\'' % abspath(p) for p in paths]))
     

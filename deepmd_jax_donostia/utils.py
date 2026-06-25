@@ -267,9 +267,9 @@ def load_model(path, replicate=True):
     import sys
     model_module = None
     try:
-        model_module = importlib.import_module('deepmd_jax_danel.dpmodel')
+        model_module = importlib.import_module('deepmd_jax_donostia.dpmodel')
     except Exception as e:
-        print('# Warning: failed to import deepmd_jax_danel.dpmodel:', e)
+        print('# Warning: failed to import deepmd_jax_donostia.dpmodel:', e)
     orig_dpmodel = sys.modules.get('deepmd_jax.dpmodel')
     if model_module is not None:
         sys.modules['deepmd_jax.dpmodel'] = model_module

@@ -4,7 +4,7 @@ from setuptools.command.develop import develop
 from setuptools.command.install import install
 
 setup(
-    name='deepmd_jax_danel',
+    name='deepmd_jax_donostia',
     version='0.2',
     packages=find_packages(),
     install_requires=[
