@@ -619,23 +619,38 @@ def train(
 
         batch, type_idx, lattice_args = get_batch_train()
         static_args = nn.FrozenDict({'lattice': lattice_args})
-        variables, opt_state, state = train_step(batch,
-                                                 variables,
-                                                 opt_state,
-                                                 state,
-                                                 static_args)
+        
+        # =================================================================
+        # MODIFICATION: Bloque Try-Except para depurar desbordamientos de VRAM
+        # Atrapa el error y nos dice exactamente qué DataLeaf causó el colapso.
+        # =================================================================
+        try:
+            variables, opt_state, state = train_step(batch,
+                                                     variables,
+                                                     opt_state,
+                                                     state,
+                                                     static_args)
+        except Exception as e:
+            print("\n" + "="*60)
+            print("🚨 ERROR FATAL DE MEMORIA DETECTADO (VRAM EXHAUSTED) 🚨")
+            print(f"Iteración que rompió el modelo: {iteration}")
+            print(f"Batch Size (Moléculas enviadas): {batch['coord'].shape[0]}")
+            print(f"Tamaño del Bucket (Átomos por molécula): {batch['coord'].shape[1]}")
+            print(f"Volumen total de átomos procesados: {batch['coord'].shape[0] * batch['coord'].shape[1]}")
+            print("="*60 + "\n")
+            raise e
         
         # training step part 2 in hybrid observable training
         if hybrid and iteration % obs_step_every == 0:
             # observable train step
             for i in range(len(obs_train_data_path)):
-                batch, type_idx, lattice_args = get_batch_train_obs(obs_position=i)
-                static_args = nn.FrozenDict({'lattice': lattice_args})
-                variables, opt_state, state_obs = train_step_obs(batch,
+                batch_obs, type_idx_obs, lattice_args_obs = get_batch_train_obs(obs_position=i)
+                static_args_obs = nn.FrozenDict({'lattice': lattice_args_obs})
+                variables, opt_state, state_obs = train_step_obs(batch_obs,
                                                         variables,
                                                         opt_state,
                                                         state_obs,
-                                                        static_args,
+                                                        static_args_obs,
                                                         obs_position=i) 
 
         if iteration % print_every == 0:

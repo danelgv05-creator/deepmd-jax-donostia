@@ -211,32 +211,20 @@ class DatasetLeaf:
 
     def get_batch(self, batch_size, type='frame'):
         if type == 'label':
-            batch_size = int(batch_size / self.nlabels + 1)
+            batch_size = max(int(batch_size / (self.natoms + self.lattice_args['lattice_max'])),1)
         
-        # =================================================================
-        # MODIFICATION: Dynamic Batch Size (VRAM Protection)
-        # Fixes the volume of atoms per batch rather than the number of frames.
-        # =================================================================
-        vram_atom_budget = 2048  # Límite seguro
-        dynamic_bs = max(1, vram_atom_budget // self.natoms)
-        
-        # Usamos el menor entre el batch solicitado y el dinámico permitido
-        actual_bs = min(batch_size, dynamic_bs)
-        
-        indices = np.arange(self.pointer, self.pointer + actual_bs) % self.nframes
-        self.pointer = (self.pointer + actual_bs) % self.nframes
+        indices = np.arange(self.pointer, self.pointer + batch_size) % self.nframes
+        self.pointer = (self.pointer + batch_size) % self.nframes
             
         batch = {
             'atomic' if 'atomic' in l else l:
             self.data[l][indices]
             for l in self.data
         }
-
-        # --- Inyectar type_idx limpio según si es 1D o 2D ---
         if self.type_idx.ndim == 2:
             batch['type_idx'] = self.type_idx[indices]
         else:
-            batch['type_idx'] = np.tile(self.type_idx, (actual_bs, 1))
+            batch['type_idx'] = np.tile(self.type_idx, (batch_size, 1))
 
         return batch, tuple(self.type_idx.flatten()), self.lattice_args
 
@@ -358,10 +346,10 @@ class DatasetGroup:
         # MODIFICATION: Unify lattice_args across all subsets
         # This prevents recompilation when switching between different leaves.
         # =================================================================
-        best_subset = max(self.subsets, key=lambda s: s.lattice_args['lattice_max'])
-        global_lattice_args = best_subset.lattice_args
-        for subset in self.subsets:
-            subset.lattice_args = global_lattice_args
+        #best_subset = max(self.subsets, key=lambda s: s.lattice_args['lattice_max'])
+        #global_lattice_args = best_subset.lattice_args
+        #for subset in self.subsets:
+        #    subset.lattice_args = global_lattice_args
 
     def get_stats(self, rcut, bs):
         self.params = {'rcut': rcut}
@@ -465,22 +453,40 @@ class ExtXYZDataset(DatasetGroup):
         # MODIFICATION: O(1) Bucket Hashing for Matbench/MPTraj
         # Group by padded bucket size instead of exact chemical sequence.
         # =================================================================
+        # =================================================================
+        # MODIFICATION: 2D Bucket Hashing (Atoms + Lattice Args)
+        # Separa los "outliers" de lattice en sus propios buckets para
+        # no penalizar la eficiencia computacional de la mayoría de datos.
+        # =================================================================
         groups = {}
         buckets = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
+        
+        # Nuevos "Tiers" para clasificar las cajas vecinas (Lattice)
+        lattice_buckets = [20, 30, 50, 70, 90, 110, 200]
+        
+        # Recuperamos el rcut de los parámetros (por defecto 6.0 Å si no existe)
+        rcut = params.get('rcut', 6.0) if params else 6.0
 
         for entry in raw_frames:
             zs = entry.pop('_zs')
             types = np.array([z_to_idx[int(z)] for z in zs], dtype=int)
             raw_natoms = len(types)
             
-            bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
-            pad_len = bucket - raw_natoms
+            # 1. Cubeta de Átomos
+            atom_bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+            pad_len = atom_bucket - raw_natoms
             
-            # Guardar el conteo de elementos reales de ESTE frame para el Ebias
+            # 2. Cubeta de Lattice (Aislamos los outliers)
+            # Evaluamos la caja de esta molécula de forma individual
+            box_jnp = jnp.array([entry['box']])
+            l_max = compute_lattice_candidate(box_jnp, rcut, print_info=False)['lattice_max']
+            l_bucket = next((b for b in lattice_buckets if b >= l_max), l_max)
+            
+            # Guardar el conteo de elementos reales
             type_count = np.bincount(types, minlength=len(chemical_types))
             entry['_type_count'] = type_count
             
-            # Aplicar padding individualmente para que NumPy deje agruparlos
+            # Aplicar padding individualmente
             if pad_len > 0:
                 types = np.pad(types, (0, pad_len), constant_values=-1)
                 for l in labels:
@@ -489,23 +495,26 @@ class ExtXYZDataset(DatasetGroup):
                     elif 'atomic' in l:
                         entry[l] = np.pad(entry[l], ((0, pad_len), (0, 0)), mode='constant')
             
-            grp = groups.setdefault(bucket, {'type': [], 'frames': []})
+            # 3. La Clave 2D: Agrupamos por (Átomos, Lattice)
+            grp_key = (atom_bucket, l_bucket)
+            grp = groups.setdefault(grp_key, {'type': [], 'frames': []})
             grp['type'].append(types)
             grp['frames'].append(entry)
 
         subsets = []
-        for bucket, grp in groups.items():
+        for grp_key, grp in groups.items():
             frames = grp['frames']
             data = {l: np.stack([f[l] for f in frames]) for l in labels}
             data['_type_counts'] = np.stack([f['_type_count'] for f in frames])
             
             type_arr_2d = np.stack(grp['type'])
-            subsets.append(DatasetLeaf(labels, params or {}, type_arr_2d, data))
+            
+            # Creamos la hoja. Ahora cada hoja es matemáticamente pura.
+            leaf = DatasetLeaf(labels, params or {}, type_arr_2d, data)
+            subsets.append(leaf)
 
         super().__init__(subsets, chemical_types=chemical_types)
-        print('# Dataset loaded (extxyz bucketed): %d frames grouped into %d bucket(s). Path:'
-              % (len(raw_frames), len(subsets)),
-              ''.join(['\n# \t\'%s\'' % abspath(p) for p in paths]))
+        print(f'# Dataset loaded (2D Bucketed): {len(raw_frames)} frames grouped into {len(subsets)} distinct (Atom, Lattice) bucket(s).')
     
 
 
