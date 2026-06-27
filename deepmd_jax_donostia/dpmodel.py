@@ -65,14 +65,7 @@ class DPModel(nn.Module):
         # NOTE: We now unpack idx_nm (3 items) from the modified get_relative_coord
         # =================================================================
         x_n3m, r_nm, idx_nm = get_relative_coord(coord_N3, box_33, type_count, static_args.get('lattice',None), nbrs_nm)
-        # --- NUEVO: MÁSCARA DE ANIQUILACIÓN DE FANTASMAS ---
-        # Funciona como una compuerta lógica AND: El mensaje solo viaja si 
-        # el átomo central ES REAL (1.0) y el vecino ES REAL (1.0).
-        valid_interaction = mask[:, None] * mask[idx_nm[0][0]]
-        
-        # Multiplicamos el Smooth Cutoff (sr) por la matriz de validez.
-        # Los fantasmas se apagan matemáticamente produciendo vectores de ceros puros.
-        sr_nm = [[sr(r, self.params['rcut']) * valid_interaction for r in R] for R in r_nm]
+        sr_nm = [[sr(r, self.params['rcut']) for r in R] for R in r_nm]
         
         global_mean = jnp.mean(jnp.array(self.params['sr_mean']))
         global_std  = jnp.mean(jnp.array(self.params['sr_std']))

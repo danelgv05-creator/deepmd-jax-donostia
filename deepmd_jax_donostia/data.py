@@ -19,6 +19,25 @@ def _flatten_paths(paths):
             yield p
 
 
+def _resolve_bucket(value, buckets):
+    return next((b for b in buckets if b >= value), value)
+
+
+def _infer_lattice_buckets(lattice_max_values, params=None):
+    configured = (params or {}).get('lattice_buckets', None)
+    if configured is not None:
+        return [int(b) for b in configured]
+    if not lattice_max_values:
+        return [30, 70, 110, 200]
+    values = np.array(sorted(lattice_max_values), dtype=int)
+    if len(values) == 1:
+        return [int(values[0])]
+    quantiles = np.quantile(values, [0.6, 0.8, 0.9, 0.95, 0.99])
+    buckets = np.unique(np.round(quantiles).astype(int))
+    buckets = np.append(buckets, values.max())
+    return [int(b) for b in np.unique(buckets)]
+
+
 def Dataset(paths, labels, params=None, chemical_types=None):
     """
     Create a dataset object from file paths.
@@ -76,7 +95,7 @@ class DatasetLeaf:
     Data is stored in the input atom order. The model receives ``type_idx`` and
     handles type sorting internally.
     """
-    def __init__(self, labels, params, type_arr, data, paths=None):
+    def __init__(self, labels, params, type_arr, data, paths=None, bucket_key=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
         type_arr = np.array(type_arr, dtype=int)
         
@@ -84,6 +103,7 @@ class DatasetLeaf:
         if type_arr.ndim == 2:
             self.type_idx = type_arr  # (N_frames, N_atoms)
             self.natoms = type_arr.shape[1]
+            self.bucket_key = bucket_key
             self.data = data
             self.nframes = len(self.data['coord'])
             
@@ -111,7 +131,8 @@ class DatasetLeaf:
                 
             if paths is not None:
                 from os.path import abspath
-                print('# Dataset Leaf (Bucket %d): %d frames. Path:' % (self.natoms, self.nframes),
+                bucket_desc = '' if self.bucket_key is None else f' | BucketKey {self.bucket_key}'
+                print('# Dataset Leaf (Bucket %d)%s: %d frames. Path:' % (self.natoms, bucket_desc, self.nframes),
                       ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
 
         # --- LÓGICA ANTERIOR: Para formato DP clásico (1D) ---
@@ -229,7 +250,8 @@ class DatasetLeaf:
         return batch, tuple(self.type_idx.flatten()), self.lattice_args
 
     def compute_lattice_candidate(self, rcut):
-        self.lattice_args = compute_lattice_candidate(self.data['box'], rcut)
+        self.lattice_args = compute_lattice_candidate(self.data['box'], rcut, print_info=False)
+        print(f"# 🧊 Bucket Listo -> Átomos (Padded): {self.natoms:<4} | Cajas (Lattice Max): {self.lattice_args['lattice_max']:<4} | Frames: {self.nframes}")
 
     def get_stats(self, rcut, bs):
         self.params = {'rcut': rcut}
@@ -412,6 +434,8 @@ class ExtXYZDataset(DatasetGroup):
     def __init__(self, paths, labels, params=None, chemical_types=None):
         raw_frames = []
         all_zs = set()
+        lattice_max_values = []
+        rcut = params.get('rcut', 6.0) if params else 6.0
         for path in paths:
             atoms_list = read(path, index=':')
             if not isinstance(atoms_list, list):
@@ -436,6 +460,10 @@ class ExtXYZDataset(DatasetGroup):
                             entry[l] = np.asarray(atoms.info[l], dtype=np.float32)
                         else:
                             raise ValueError('Label %s not found in extxyz frame from %s' % (l, path))
+                if 'box' in entry:
+                    lattice_info = compute_lattice_candidate(jnp.array([entry['box']]), rcut, print_info=False)
+                    entry['_lattice_max'] = int(lattice_info['lattice_max'])
+                    lattice_max_values.append(entry['_lattice_max'])
                 raw_frames.append(entry)
 
         if chemical_types is None:
@@ -459,13 +487,11 @@ class ExtXYZDataset(DatasetGroup):
         # no penalizar la eficiencia computacional de la mayoría de datos.
         # =================================================================
         groups = {}
-        buckets = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
-        
-        # Nuevos "Tiers" para clasificar las cajas vecinas (Lattice)
-        lattice_buckets = [20, 30, 50, 70, 90, 110, 200]
-        
-        # Recuperamos el rcut de los parámetros (por defecto 6.0 Å si no existe)
-        rcut = params.get('rcut', 6.0) if params else 6.0
+        atom_buckets = [4, 8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024]
+        configured_atom_buckets = (params or {}).get('atom_buckets', None)
+        if configured_atom_buckets is not None:
+            atom_buckets = [int(b) for b in configured_atom_buckets]
+        lattice_buckets = _infer_lattice_buckets(lattice_max_values, params)
 
         for entry in raw_frames:
             zs = entry.pop('_zs')
@@ -473,14 +499,14 @@ class ExtXYZDataset(DatasetGroup):
             raw_natoms = len(types)
             
             # 1. Cubeta de Átomos
-            atom_bucket = next((b for b in buckets if b >= raw_natoms), raw_natoms)
+            atom_bucket = _resolve_bucket(raw_natoms, atom_buckets)
             pad_len = atom_bucket - raw_natoms
             
             # 2. Cubeta de Lattice (Aislamos los outliers)
-            # Evaluamos la caja de esta molécula de forma individual
-            box_jnp = jnp.array([entry['box']])
-            l_max = compute_lattice_candidate(box_jnp, rcut, print_info=False)['lattice_max']
-            l_bucket = next((b for b in lattice_buckets if b >= l_max), l_max)
+            l_max = entry.get('_lattice_max')
+            if l_max is None:
+                l_max = compute_lattice_candidate(jnp.array([entry['box']]), rcut, print_info=False)['lattice_max']
+            l_bucket = _resolve_bucket(int(l_max), lattice_buckets)
             
             # Guardar el conteo de elementos reales
             type_count = np.bincount(types, minlength=len(chemical_types))
@@ -510,11 +536,14 @@ class ExtXYZDataset(DatasetGroup):
             type_arr_2d = np.stack(grp['type'])
             
             # Creamos la hoja. Ahora cada hoja es matemáticamente pura.
-            leaf = DatasetLeaf(labels, params or {}, type_arr_2d, data)
+            leaf = DatasetLeaf(labels, params or {}, type_arr_2d, data, bucket_key=grp_key)
             subsets.append(leaf)
 
         super().__init__(subsets, chemical_types=chemical_types)
         print(f'# Dataset loaded (2D Bucketed): {len(raw_frames)} frames grouped into {len(subsets)} distinct (Atom, Lattice) bucket(s).')
+        if lattice_buckets:
+            print('# Lattice bucket thresholds:', lattice_buckets)
+        print('# Paths:', ''.join(['\n# \t\'%s\'' % abspath(path) for path in paths]))
     
 
 
