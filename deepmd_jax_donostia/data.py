@@ -27,15 +27,11 @@ def _infer_lattice_buckets(lattice_max_values, params=None):
     configured = (params or {}).get('lattice_buckets', None)
     if configured is not None:
         return [int(b) for b in configured]
-    if not lattice_max_values:
-        return [30, 70, 110, 200]
-    values = np.array(sorted(lattice_max_values), dtype=int)
-    if len(values) == 1:
-        return [int(values[0])]
-    quantiles = np.quantile(values, [0.6, 0.8, 0.9, 0.95, 0.99])
-    buckets = np.unique(np.round(quantiles).astype(int))
-    buckets = np.append(buckets, values.max())
-    return [int(b) for b in np.unique(buckets)]
+
+    # Keep lattice bucketing stable and aligned with the intended grouping logic.
+    # Using the fixed thresholds avoids exploding the number of 2D buckets when
+    # the dataset contains many small lattice values.
+    return [30, 70, 110, 200]
 
 
 def Dataset(paths, labels, params=None, chemical_types=None):
@@ -95,8 +91,9 @@ class DatasetLeaf:
     Data is stored in the input atom order. The model receives ``type_idx`` and
     handles type sorting internally.
     """
-    def __init__(self, labels, params, type_arr, data, paths=None, bucket_key=None):
+    def __init__(self, labels, params, type_arr, data, paths=None, bucket_key=None, lattice_args=None):
         self.chemical_types = getattr(self, 'chemical_types', None)
+        self.lattice_args = lattice_args
         type_arr = np.array(type_arr, dtype=int)
         
         # --- NUEVA LÓGICA: Soporte para Buckets 2D (ExtXYZ y Matbench) ---
@@ -250,7 +247,13 @@ class DatasetLeaf:
         return batch, tuple(self.type_idx.flatten()), self.lattice_args
 
     def compute_lattice_candidate(self, rcut):
-        self.lattice_args = compute_lattice_candidate(self.data['box'], rcut, print_info=False)
+        if self.lattice_args is None:
+            self.lattice_args = compute_lattice_candidate(self.data['box'], rcut, print_info=False)
+        else:
+            self.lattice_args = {
+                **self.lattice_args,
+                'lattice_max': int(self.lattice_args.get('lattice_max', 0)),
+            }
         print(f"# 🧊 Bucket Listo -> Átomos (Padded): {self.natoms:<4} | Cajas (Lattice Max): {self.lattice_args['lattice_max']:<4} | Frames: {self.nframes}")
 
     def get_stats(self, rcut, bs):
@@ -368,10 +371,10 @@ class DatasetGroup:
         # MODIFICATION: Unify lattice_args across all subsets
         # This prevents recompilation when switching between different leaves.
         # =================================================================
-        #best_subset = max(self.subsets, key=lambda s: s.lattice_args['lattice_max'])
-        #global_lattice_args = best_subset.lattice_args
-        #for subset in self.subsets:
-        #    subset.lattice_args = global_lattice_args
+        best_subset = max(self.subsets, key=lambda s: s.lattice_args['lattice_max'])
+        global_lattice_args = best_subset.lattice_args
+        for subset in self.subsets:
+            subset.lattice_args = global_lattice_args
 
     def get_stats(self, rcut, bs):
         self.params = {'rcut': rcut}
@@ -435,6 +438,8 @@ class ExtXYZDataset(DatasetGroup):
         raw_frames = []
         all_zs = set()
         lattice_max_values = []
+        frame_boxes = []
+        frame_indices = []
         rcut = params.get('rcut', 6.0) if params else 6.0
         for path in paths:
             atoms_list = read(path, index=':')
@@ -460,11 +465,16 @@ class ExtXYZDataset(DatasetGroup):
                             entry[l] = np.asarray(atoms.info[l], dtype=np.float32)
                         else:
                             raise ValueError('Label %s not found in extxyz frame from %s' % (l, path))
-                if 'box' in entry:
-                    lattice_info = compute_lattice_candidate(jnp.array([entry['box']]), rcut, print_info=False)
-                    entry['_lattice_max'] = int(lattice_info['lattice_max'])
-                    lattice_max_values.append(entry['_lattice_max'])
                 raw_frames.append(entry)
+                if 'box' in entry:
+                    frame_boxes.append(entry['box'])
+                    frame_indices.append(len(raw_frames) - 1)
+
+        if frame_boxes:
+            lattice_maxes = _compute_lattice_maxes(jnp.array(frame_boxes, dtype=jnp.float32), rcut)
+            for frame_idx, lattice_max in zip(frame_indices, lattice_maxes):
+                raw_frames[frame_idx]['_lattice_max'] = int(lattice_max)
+                lattice_max_values.append(int(lattice_max))
 
         if chemical_types is None:
             chemical_types = tuple(sorted(all_zs))
@@ -497,6 +507,7 @@ class ExtXYZDataset(DatasetGroup):
             zs = entry.pop('_zs')
             types = np.array([z_to_idx[int(z)] for z in zs], dtype=int)
             raw_natoms = len(types)
+            entry['_type_count'] = np.bincount(types, minlength=len(chemical_types))
             
             # 1. Cubeta de Átomos
             atom_bucket = _resolve_bucket(raw_natoms, atom_buckets)
@@ -507,10 +518,6 @@ class ExtXYZDataset(DatasetGroup):
             if l_max is None:
                 l_max = compute_lattice_candidate(jnp.array([entry['box']]), rcut, print_info=False)['lattice_max']
             l_bucket = _resolve_bucket(int(l_max), lattice_buckets)
-            
-            # Guardar el conteo de elementos reales
-            type_count = np.bincount(types, minlength=len(chemical_types))
-            entry['_type_count'] = type_count
             
             # Aplicar padding individualmente
             if pad_len > 0:
@@ -523,9 +530,10 @@ class ExtXYZDataset(DatasetGroup):
             
             # 3. La Clave 2D: Agrupamos por (Átomos, Lattice)
             grp_key = (atom_bucket, l_bucket)
-            grp = groups.setdefault(grp_key, {'type': [], 'frames': []})
+            grp = groups.setdefault(grp_key, {'type': [], 'frames': [], 'boxes': []})
             grp['type'].append(types)
             grp['frames'].append(entry)
+            grp['boxes'].append(entry['box'])
 
         subsets = []
         for grp_key, grp in groups.items():
@@ -535,8 +543,10 @@ class ExtXYZDataset(DatasetGroup):
             
             type_arr_2d = np.stack(grp['type'])
             
-            # Creamos la hoja. Ahora cada hoja es matemáticamente pura.
-            leaf = DatasetLeaf(labels, params or {}, type_arr_2d, data, bucket_key=grp_key)
+            # Restauramos el comportamiento más ligero del flujo anterior:
+            # no computamos lattice args de forma eager para cada bucket;
+            # cada hoja los calculará cuando el entrenamiento los necesite.
+            leaf = DatasetLeaf(labels, params or {}, type_arr_2d, data, bucket_key=grp_key, lattice_args=None)
             subsets.append(leaf)
 
         super().__init__(subsets, chemical_types=chemical_types)
@@ -547,19 +557,72 @@ class ExtXYZDataset(DatasetGroup):
     
 
 
+def _compute_lattice_maxes(boxes, rcut):
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.ndim == 2:
+        boxes = boxes[None]
+
+    ortho = not np.any(np.array([box - np.diag(np.diag(box)) for box in boxes]).any())
+    recp_norm = np.linalg.norm(np.linalg.inv(boxes), axis=-1)
+    n = np.ceil(rcut * recp_norm - 0.5).astype(int)
+    n_max = n.max(axis=0)
+
+    lattice_cand = np.stack(
+        np.meshgrid(
+            np.arange(-n_max[0], n_max[0] + 1),
+            np.arange(-n_max[1], n_max[1] + 1),
+            np.arange(-n_max[2], n_max[2] + 1),
+            indexing='ij',
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    trial_points = np.stack(
+        np.meshgrid(np.arange(-2, 3), np.arange(-2, 3), np.arange(-2, 3)),
+        axis=-1,
+    ).reshape(-1, 3) / 4.0
+
+    diff = lattice_cand[:, None, :] - trial_points[None, :, :]
+    cart = np.einsum('ctd,bde->bcte', diff, boxes)
+    is_neighbor = np.linalg.norm(cart, axis=-1) < rcut
+    counts = is_neighbor.sum(axis=2)
+    lattice_maxes = counts.max(axis=1)
+    return lattice_maxes.astype(int)
+
+
 def compute_lattice_candidate(boxes, rcut, print_info=True, disable_ortho=False):
-    N = 2  # This algorithm is heuristic and subject to change. Increase N in case of missing neighbors.
-    ortho = not vmap(lambda box: box - jnp.diag(jnp.diag(box)))(boxes).any()
-    recp_norm = jnp.linalg.norm((jnp.linalg.inv(boxes)), axis=-1)
-    n = np.ceil(rcut * recp_norm - 0.5).astype(int).max(0)
-    lattice_cand = jnp.stack(
-        np.meshgrid(range(-n[0], n[0] + 1), range(-n[1], n[1] + 1), range(-n[2], n[2] + 1), indexing='ij'),
-        axis=-1).reshape(-1, 3)
-    trial_points = jnp.stack(np.meshgrid(np.arange(-N, N + 1), np.arange(-N, N + 1), np.arange(-N, N + 1)),
-                             axis=-1).reshape(-1, 3) / (2 * N)
-    is_neighbor = jnp.linalg.norm((lattice_cand[:, None] - trial_points)[None] @ boxes[:, None], axis=-1) < rcut
-    lattice_cand = np.array(lattice_cand[is_neighbor.any((0, 2))])
-    lattice_max = is_neighbor.sum(1).max().item()
+    boxes = np.asarray(boxes, dtype=np.float32)
+    if boxes.ndim == 2:
+        boxes = boxes[None]
+
+    ortho = not np.any(np.array([box - np.diag(np.diag(box)) for box in boxes]).any())
+    recp_norm = np.linalg.norm(np.linalg.inv(boxes), axis=-1)
+    n = np.ceil(rcut * recp_norm - 0.5).astype(int)
+    n_max = n.max(axis=0)
+
+    lattice_cand = np.stack(
+        np.meshgrid(
+            np.arange(-n_max[0], n_max[0] + 1),
+            np.arange(-n_max[1], n_max[1] + 1),
+            np.arange(-n_max[2], n_max[2] + 1),
+            indexing='ij',
+        ),
+        axis=-1,
+    ).reshape(-1, 3)
+    trial_points = np.stack(
+        np.meshgrid(np.arange(-2, 3), np.arange(-2, 3), np.arange(-2, 3)),
+        axis=-1,
+    ).reshape(-1, 3) / 4.0
+
+    diff = lattice_cand[:, None, :] - trial_points[None, :, :]
+    cart = np.einsum('ctd,bde->bcte', diff, boxes)
+    is_neighbor = np.linalg.norm(cart, axis=-1) < rcut
+    active_candidates = is_neighbor.any(axis=(0, 2))
+    lattice_cand = lattice_cand[active_candidates]
+    lattice_max = int(is_neighbor.sum(axis=2).max())
+    if lattice_cand.size:
+        lattice_max = min(lattice_max, len(lattice_cand))
+    else:
+        lattice_max = 0
     if print_info:
         print('# Lattice vectors for neighbor images: Max %d out of %d candidates.' % (lattice_max, len(lattice_cand)))
     return {'lattice_cand': tuple(map(tuple, lattice_cand)),

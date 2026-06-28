@@ -88,9 +88,15 @@ def get_relative_coord(coord_N3, box_33, type_count, lattice_args, nbrs_nm=None)
                             M_repeats = X # Each atom is repeated X times for lattice images
                         else:
                             r_NMX = jnp.linalg.norm(jnp.where(jnp.abs(x_N3MX) > 1e-15, x_N3MX, 1e-15), axis=1)
-                            idx_NMY = jnp.argpartition(r_NMX, lattice_args['lattice_max'], axis=-1)[:,:,:lattice_args['lattice_max']]
-                            x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
-                            M_repeats = Y # Each atom is repeated Y times
+                            n_keep = min(int(lattice_args['lattice_max']), X)
+                            if n_keep <= 0:
+                                x_N3M = jnp.zeros((N, 3, 0), dtype=coord_N3.dtype)
+                                M_repeats = 0
+                            else:
+                                kth = max(0, n_keep - 1)
+                                idx_NMY = jnp.argpartition(r_NMX, kth, axis=-1)[:,:,:n_keep]
+                                x_N3M = jnp.take_along_axis(x_N3MX, idx_NMY[:,None], axis=-1).reshape(N,3,-1)
+                                M_repeats = n_keep # Each atom is repeated n_keep times
                     else:
                         M_repeats = 1
                         
